@@ -192,6 +192,16 @@ class TestGenerateDatasetPlans:
         with pytest.raises(ValueError, match="changed text"):
             generate_dataset_plans(self.questions, path, model="m", client=FakeOpenAI([]))
 
+    def test_changed_model_requires_a_new_file_before_api_calls(self, tmp_path):
+        path = tmp_path / "p.jsonl"
+        save_teacher_plan(record("q1", question="A?"), path)
+        original = path.read_bytes()
+        client = FakeOpenAI([])
+        with pytest.raises(ValueError, match="different or unknown model"):
+            generate_dataset_plans(self.questions, path, model="new-model", client=client)
+        assert client.calls == []
+        assert path.read_bytes() == original
+
     def test_fails_fast_but_keeps_earlier_records(self, tmp_path):
         path = tmp_path / "p.jsonl"
         client = FakeOpenAI([reply(), "broken"])

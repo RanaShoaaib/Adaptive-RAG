@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from adaptive_rag.config import SLM_MODEL, SLM_MAX_NEW_TOKENS, SEED
+from adaptive_rag.evaluation.checkpoint import fingerprint
+from adaptive_rag.evaluation.experiment import _write_json_atomic
 from adaptive_rag.planner.prompted import validate_query_plan
 
 SYSTEM_PROMPT = (
@@ -180,26 +182,52 @@ def train_planner(
     dropout: float = 0.05, epochs: float = 3.0,
     learning_rate: float = 2e-4, batch_size: int = 2,
     gradient_accumulation_steps: int = 8, seed: int = SEED,
+    resume_from_checkpoint: str | Path | bool = False,
 ):
     """Fine-tune on selected plans; save adapter/tokenizer to output_dir.
 
     Returns (trainer, model, tokenizer). The caller controls where artifacts persist.
     """
-    import torch
-    from transformers import Trainer, TrainingArguments
     if not train_records or not val_records:
         raise ValueError("Nonempty train and validation records are required")
     if {r["question_id"] for r in train_records} & {r["question_id"] for r in val_records}:
         raise ValueError("Training and validation question IDs overlap")
+    import torch
+    from transformers import Trainer, TrainingArguments, set_seed
+    from transformers.trainer_utils import get_last_checkpoint
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir = output_dir / "checkpoints"
+    config_path = output_dir / "training_config.json"
+    config = {
+        "model_name": model_name, "use_4bit": use_4bit, "max_length": max_length,
+        "rank": rank, "alpha": alpha, "dropout": dropout, "epochs": epochs,
+        "learning_rate": learning_rate, "batch_size": batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps, "seed": seed,
+        "train_examples": len(train_records), "val_examples": len(val_records),
+        "train_sha256": fingerprint(train_records), "val_sha256": fingerprint(val_records),
+    }
+    latest = get_last_checkpoint(str(checkpoints_dir)) if checkpoints_dir.is_dir() else None
+    checkpoint = None
+    if resume_from_checkpoint:
+        if resume_from_checkpoint is True and latest is None:
+            raise ValueError(f"No training checkpoints found in {checkpoints_dir}")
+        checkpoint = Path(latest if resume_from_checkpoint is True else resume_from_checkpoint).resolve()
+        if checkpoint.parent != checkpoints_dir.resolve() or not (checkpoint / "trainer_state.json").is_file():
+            raise ValueError(f"Expected a Trainer checkpoint in {checkpoints_dir}: {checkpoint}")
+        if not config_path.is_file() or json.loads(config_path.read_text(encoding="utf-8")) != config:
+            raise ValueError("Training data or configuration cannot be verified. Use a new output directory.")
+    elif latest is not None:
+        raise ValueError(f"Checkpoints already exist in {checkpoints_dir}. Resume or use a new output directory.")
+
+    set_seed(seed)
     model, tokenizer = load_base_model(model_name, use_4bit=use_4bit)
     model = configure_lora(model, rank=rank, alpha=alpha, dropout=dropout, use_4bit=use_4bit)
     model.config.use_cache = False
     train_data = tokenize_sft_examples(train_records, tokenizer, max_length=max_length)
     val_data = tokenize_sft_examples(val_records, tokenizer, max_length=max_length)
     args = TrainingArguments(
-        output_dir=str(output_dir / "checkpoints"),
+        output_dir=str(checkpoints_dir),
         num_train_epochs=epochs,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
@@ -223,17 +251,10 @@ def train_planner(
         eval_dataset=val_data,
         data_collator=CompletionCollator(tokenizer),
     )
-    trainer.train()
+    _write_json_atomic(config_path, config)
+    trainer.train(resume_from_checkpoint=str(checkpoint) if checkpoint else None)
     model.save_pretrained(output_dir / "adapter")
     tokenizer.save_pretrained(output_dir / "adapter")
-    with (output_dir / "training_config.json").open("w", encoding="utf-8") as stream:
-        json.dump({
-            "model_name": model_name, "use_4bit": use_4bit, "max_length": max_length,
-            "rank": rank, "alpha": alpha, "dropout": dropout, "epochs": epochs,
-            "learning_rate": learning_rate, "batch_size": batch_size,
-            "gradient_accumulation_steps": gradient_accumulation_steps, "seed": seed,
-            "train_examples": len(train_records), "val_examples": len(val_records),
-        }, stream, indent=2)
     return trainer, model, tokenizer
 
 

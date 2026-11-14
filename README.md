@@ -41,9 +41,9 @@ The run saves its checkpoint under `results/baseline_once/` and writes `config.j
    python scripts/prepare_subsets.py
    ```
 
-1. [Prepare training data](notebooks/01_prepare_training_data.ipynb). Set `OPENAI_API_KEY` and `OPENAI_TEACHER_MODEL` for teacher generation. Use the populated Weaviate index to score both plans, then export `planner_train.jsonl`. Teacher generation uses the OpenAI API. The retrieval stage runs embedding, reranking, and rewriting models locally, where a GPU is recommended.
-2. [Train the planner](notebooks/02_train_planner.ipynb). Install the training extra with `python -m pip install -e ".[training]"` for a local checkout, or use the notebook's Colab setup. Point it at `planner_train.jsonl`. The default 4-bit QLoRA setup requires a CUDA GPU and saves a PEFT adapter and tokenizer.
-3. [Evaluate the planner](notebooks/03_evaluate_planner.ipynb). The notebook expects a CUDA GPU, access to the populated Weaviate index, the held-out `test_subset.parquet`, and an adapter for fine-tuned modes. It compares three base-model conditions with three adapter conditions using the same test questions.
+1. [Prepare training data](notebooks/01_prepare_training_data.ipynb). Set `OPENAI_API_KEY` and `OPENAI_TEACHER_MODEL` for teacher generation. Use the populated Weaviate index to score both plans, then export `planner_train.jsonl`. In Colab, notebook 01 writes directly to Drive under `subsets/planner_training/<TRAINING_DATA_RUN>/`. Teacher generation uses the OpenAI API. The retrieval stage runs embedding, reranking, and rewriting models locally, where a GPU is recommended.
+2. [Train the planner](notebooks/02_train_planner.ipynb). Install the training extra with `python -m pip install -e ".[training]"` for a local checkout, or use the notebook's Colab setup. Use the same `TRAINING_DATA_RUN` as notebook 01. To resume an interrupted run, set `RESUME_FROM_CHECKPOINT = True` with the same training data, settings, and output directory. The default 4-bit QLoRA setup requires a CUDA GPU and saves a PEFT adapter and tokenizer.
+3. [Evaluate the planner](notebooks/03_evaluate_planner.ipynb). The notebook expects a CUDA GPU, access to the populated Weaviate index, the held-out `test_subset.parquet` from its checkout, and an adapter for fine-tuned modes. It compares three base-model conditions with three adapter conditions using the same test questions.
 
 ## Tests
 

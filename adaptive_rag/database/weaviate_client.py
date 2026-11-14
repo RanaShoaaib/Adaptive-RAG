@@ -5,7 +5,7 @@ import weaviate
 from contextlib import contextmanager
 from dotenv import load_dotenv
 from weaviate.classes.init import Auth, AdditionalConfig, Timeout
-from adaptive_rag.config import ROOT_DIR
+from adaptive_rag.config import COLLECTION_NAME, ROOT_DIR
 
 
 def _load_env() -> None:
@@ -92,3 +92,14 @@ def weaviate_session():
         yield client
     finally:
         client.close()
+
+
+def check_retrieval_collection(collection_name: str = COLLECTION_NAME) -> int:
+    """Check connectivity and return the number of indexed passages."""
+    with weaviate_session() as client:
+        if not client.collections.exists(collection_name):
+            raise ValueError(f"Weaviate collection {collection_name!r} is missing. Ingest the corpus first.")
+        count = client.collections.get(collection_name).aggregate.over_all(total_count=True).total_count
+        if not count:
+            raise ValueError(f"Weaviate collection {collection_name!r} is empty. Ingest the corpus first.")
+        return count

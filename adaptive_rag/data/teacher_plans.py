@@ -181,6 +181,10 @@ def generate_dataset_plans(
     Fail fast on generation errors, preserving earlier successful records.
     """
     existing = load_teacher_plans(output_path)
+    if any(row.get("model") != model for row in existing):
+        raise ValueError(
+            "Existing teacher plans use a different or unknown model. Use a new output file."
+        )
     completed = {str(row["question_id"]): row["question"] for row in existing}
     counts = {"generated": 0, "skipped": 0}
     for row in questions:

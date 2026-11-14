@@ -1,5 +1,8 @@
 """Unit tests for adaptive_rag.planner.adaptive (SFT data, masking, inference)."""
 import json
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -15,6 +18,38 @@ from adaptive_rag.planner.adaptive import (
     train_planner,
 )
 from rag_fakes import FakeChatTokenizer, once_plan, plan_json, split_plan
+
+
+def test_training_resume_verifies_data_and_settings(tmp_path, monkeypatch):
+    import transformers
+
+    checkpoint = tmp_path / "checkpoints" / "checkpoint-1"
+    trainer = Mock()
+    monkeypatch.setattr(transformers, "Trainer", Mock(return_value=trainer), raising=False)
+    monkeypatch.setattr(transformers, "TrainingArguments", Mock(), raising=False)
+    monkeypatch.setattr(transformers, "set_seed", Mock(), raising=False)
+    monkeypatch.setitem(sys.modules, "transformers.trainer_utils", SimpleNamespace(
+        get_last_checkpoint=lambda directory: str(checkpoint),
+    ))
+    model = Mock()
+    tokenizer = SimpleNamespace(pad_token_id=0, save_pretrained=Mock())
+    load_model = Mock(return_value=(model, tokenizer))
+    monkeypatch.setattr(adaptive, "load_base_model", load_model)
+    monkeypatch.setattr(adaptive, "configure_lora", lambda model, **kwargs: model)
+    monkeypatch.setattr(adaptive, "tokenize_sft_examples", lambda *args, **kwargs: [])
+
+    train, val = [example("train")], [example("val")]
+    train_planner(train, val, tmp_path)
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
+    train_planner(train, val, tmp_path, resume_from_checkpoint=True)
+    trainer.train.assert_called_with(resume_from_checkpoint=str(checkpoint.resolve()))
+
+    with pytest.raises(ValueError, match="cannot be verified"):
+        train_planner([example("train", "Changed?")], val, tmp_path, resume_from_checkpoint=True)
+    with pytest.raises(ValueError, match="cannot be verified"):
+        train_planner(train, val, tmp_path, resume_from_checkpoint=True, rank=8)
+    assert load_model.call_count == 2
 
 
 # ----------------------------------------------------------------------------- helpers
