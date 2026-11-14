@@ -1,0 +1,31 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+.idea/
+__pycache__/
+*.py[cod]
+
+# Python packaging artifacts
+*.egg-info/
+*.egg
+build/
+dist/
+
+
+# Test and tooling caches
+.pytest_cache/
+.coverage
+htmlcov/

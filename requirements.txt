@@ -1,0 +1,17 @@
+accelerate
+bitsandbytes
+datasets
+huggingface_hub
+matplotlib
+numpy
+openai
+pandas
+peft
+pyarrow
+pytest
+python-dotenv
+sentence-transformers
+torch
+tqdm
+transformers>=4.56
+weaviate-client
