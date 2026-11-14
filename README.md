@@ -18,10 +18,10 @@ Use Python 3.11 or newer and an API-key-authenticated Weaviate instance reachabl
 
 2. Use [.env.example](.env.example) to configure `.env`. Both hostnames and the API key are required. Set the HTTP and gRPC ports and TLS flags to match your instance. Omitted ports default to 443 and omitted TLS flags default to true. Host values contain only the hostname. The package loads `.env` at import time and gives existing environment variables precedence. Keep `.env` out of version control.
 
-3. Use a dedicated Weaviate instance or an empty `AdaptiveRag` collection. Ingestion can replace an existing collection whose object count differs from the corpus size. Prepare a balanced 50-question validation subset, then index the full shared HotpotQA and SQuAD corpus. The subset limits the evaluation size only.
+3. Use a dedicated Weaviate instance or an empty `AdaptiveRag` collection. Ingestion can replace an existing collection whose object count differs from the corpus size. Create the question subsets, then index the full shared HotpotQA and SQuAD corpus. The subsets limit the evaluation size only. The script refuses to overwrite existing subset files unless you pass `--force`.
 
    ```sh
-   python -c "from adaptive_rag.data.prepare_data import prepare_subsets; prepare_subsets({'val': {'n': 50, 'strategy': 'balanced'}})"
+   python scripts/prepare_subsets.py
    python -c "from adaptive_rag.database.ingestion import ingest_data; ingest_data()"
    ```
 
@@ -35,21 +35,15 @@ The run saves its checkpoint under `results/baseline_once/` and writes `config.j
 
 ## Train and evaluate the learned planner
 
+0. Create the question subsets once, locally, from the repository root. With no flags the script builds balanced train, validation, and test subsets of 1000, 500, and 500 questions under `subsets/`. Commit the small Parquet files so every clone uses the same questions. Notebook 01 validates these files but does not rebuild them.
+
+   ```sh
+   python scripts/prepare_subsets.py
+   ```
+
 1. [Prepare training data](notebooks/01_prepare_training_data.ipynb). Set `OPENAI_API_KEY` and `OPENAI_TEACHER_MODEL` for teacher generation. Use the populated Weaviate index to score both plans, then export `planner_train.jsonl`. Teacher generation uses the OpenAI API. The retrieval stage runs embedding, reranking, and rewriting models locally, where a GPU is recommended.
 2. [Train the planner](notebooks/02_train_planner.ipynb). Install the training extra with `python -m pip install -e ".[training]"` for a local checkout, or use the notebook's Colab setup. Point it at `planner_train.jsonl`. The default 4-bit QLoRA setup requires a CUDA GPU and saves a PEFT adapter and tokenizer.
 3. [Evaluate the planner](notebooks/03_evaluate_planner.ipynb). The notebook expects a CUDA GPU, access to the populated Weaviate index, the held-out `test_subset.parquet`, and an adapter for fine-tuned modes. It compares three base-model conditions with three adapter conditions using the same test questions.
-
-## Checked-in baseline results
-
-Each run used the same 50 validation questions, balanced between HotpotQA and SQuAD.
-
-| Planner | Recall@7 | Answer F1 | Mean search calls |
-| --- | ---: | ---: | ---: |
-| [Always once](results/always_once_val_001/summary.json) | 0.760 | 0.533 | 1.16 |
-| [Always split](results/always_split_val_001/summary.json) | 0.750 | 0.538 | 2.44 |
-| [Prompted adaptive](results/prompted_val_001/summary.json) | 0.720 | 0.474 | 1.30 |
-
-On this sample, always once had the highest recall and used the fewest search calls. Always split had slightly higher answer F1. These runs provide reference points for evaluating the fine-tuned planner.
 
 ## Tests
 
