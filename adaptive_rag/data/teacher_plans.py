@@ -17,32 +17,35 @@ SYSTEM_PROMPT = """You generate retrieval plans for a hybrid BM25/vector search 
 For EACH question, produce both an ONCE and a SPLIT plan, regardless of which
 strategy you personally prefer. Do not answer the question or invent facts.
 
-ONCE: Write exactly one query pair that covers the full question. Keep named
+ONCE: exactly one lexical_query and semantic_query pair covering the full
+question. Keep the named
 entities, dates, titles, and relationships that narrow the search.
 
-SPLIT: Write exactly two query pairs. Before writing each pair, identify what
-fact a relevant passage should establish. For multi-hop or comparison
-questions, target a different fact in each branch. Each branch must
-be searchable on its own using clues available in the question.
-
-If one branch depends on an entity you do not yet know, keep the
-relationship or other clues that identify it. Do not guess the entity
-or broaden the branch into a generic category search.
-
-For a question with one evidence need, use two grounded search angles
-on that same fact, such as an exact title and a distinctive relationship.
-If the question omits a subject or referent, preserve the ambiguity and
-use the available clues. Do not add generic advice or invent a second hop.
+SPLIT: exactly two distinct, complementary pairs. For multi-hop or comparison
+questions, give each branch a different fact to retrieve, independently
+retrievable without presuming an unknown intermediate answer. Describe an
+unknown entity by its role in the question; do not guess its name, and do not
+restate the whole question in one branch. For simple questions with one
+evidence need, use two complementary angles on that fact, for example the key
+entity or title in one branch and the relationship or attribute being asked
+about in the other. Retain enough identifying clues in each branch to make it
+self-contained. Avoid fabricated reasoning hops and rewordings of the same query.
 
 For yes/no questions, search for the underlying facts that could support
-either answer. Before returning the JSON, check that each split branch
-has a clear retrieval target and that neither simply repeats the full
-question or paraphrases the other branch.
+either answer.
 
-Each query pair contains a lexical_query and a semantic_query. lexical_query
-should contain concise search keywords/entities; semantic_query should express
-a natural-language information need. Preserve the meaning of the question.
-Return only the requested JSON.
+lexical_query: roughly 3-10 concise keywords/entities, with no quotation marks,
+search operators, or generic filler words that do not narrow the search.
+Preserve punctuation within names and titles when needed.
+semantic_query: a natural-language information need phrased as a question or
+a short statement of the fact sought, in the same style as the ONCE query,
+never an instruction such as "Find..." or "Identify...".
+
+Every query must be self-contained: no references like "in question" or "the
+one mentioned". Add no entities, assumptions, time order, or topics that the
+question does not state or clearly imply. If the question omits its subject,
+keep the query as general as the question is. Preserve the meaning of the
+question. Return only the requested JSON.
 """
 
 # The wrapper is for teacher generation only; each nested plan follows prompted.py.
