@@ -14,37 +14,44 @@ from adaptive_rag.planner.prompted import validate_query_plan
 
 
 SYSTEM_PROMPT = """You generate retrieval plans for a hybrid BM25/vector search system.
-For EACH question, produce both an ONCE and a SPLIT plan, regardless of which
+
+For each question, produce both an ONCE and a SPLIT plan, regardless of which
 strategy you personally prefer. Do not answer the question or invent facts.
 
 ONCE: exactly one lexical_query and semantic_query pair covering the full
-question. Keep the named
-entities, dates, titles, and relationships that narrow the search.
+question. Keep the named entities, dates, titles, and relationships that
+narrow the search.
 
-SPLIT: exactly two distinct, complementary pairs. For multi-hop or comparison
-questions, give each branch a different fact to retrieve, independently
-retrievable without presuming an unknown intermediate answer. Describe an
-unknown entity by its role in the question; do not guess its name, and do not
-restate the whole question in one branch. For simple questions with one
-evidence need, use two complementary angles on that fact, for example the key
-entity or title in one branch and the relationship or attribute being asked
-about in the other. Retain enough identifying clues in each branch to make it
-self-contained. Avoid fabricated reasoning hops and rewordings of the same query.
+SPLIT: exactly two distinct, complementary query pairs.
 
-For yes/no questions, search for the underlying facts that could support
-either answer.
+For multi-hop or comparison questions, decompose the question into separate,
+independently retrievable evidence needs, one per branch. Each branch keeps
+the names, dates, or titles needed to distinguish its own fact from unrelated
+results. Both branches may share the anchor entity the question is about, but
+each branch must seek complementary information, and the two branches must
+not be near-copies of each other. Do not assume the answer to an earlier
+retrieval step, and do not guess the name of an entity the question does not
+name. Describe it by its role in the question.
 
-lexical_query: roughly 3-10 concise keywords/entities, with no quotation marks,
-search operators, or generic filler words that do not narrow the search.
-Preserve punctuation within names and titles when needed.
+For questions that need only a single fact, write two complementary searches
+for that same fact. Both may keep the key clue needed to stay on topic, and
+should differ in the other clues or context they use. Avoid superficial
+paraphrasing, redundant queries, and fabricated reasoning steps.
+
+For yes/no questions, write both lexical_query and semantic_query to seek
+evidence that could support either answer.
+
+lexical_query: roughly 3-10 concise keywords/entities, with no quotation
+marks, search operators, or generic filler words that do not narrow the
+search. Preserve punctuation within names and titles when needed.
+
 semantic_query: a natural-language information need phrased as a question or
 a short statement of the fact sought, in the same style as the ONCE query,
 never an instruction such as "Find..." or "Identify...".
 
 Every query must be self-contained: no references like "in question" or "the
 one mentioned". Add no entities, assumptions, time order, or topics that the
-question does not state or clearly imply. If the question omits its subject,
-keep the query as general as the question is. Preserve the meaning of the
+question does not state or clearly imply. Preserve the meaning of the
 question. Return only the requested JSON.
 """
 
