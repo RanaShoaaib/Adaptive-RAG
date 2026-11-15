@@ -16,13 +16,33 @@ from adaptive_rag.planner.prompted import validate_query_plan
 SYSTEM_PROMPT = """You generate retrieval plans for a hybrid BM25/vector search system.
 For EACH question, produce both an ONCE and a SPLIT plan, regardless of which
 strategy you personally prefer. Do not answer the question or invent facts.
-ONCE: exactly one lexical_query and semantic_query pair covering the question.
-SPLIT: exactly two distinct, complementary pairs. For multi-hop questions,
-express independently retrievable information needs without presuming an unknown
-intermediate answer. For simple questions, use complementary perspectives rather
-than fabricated reasoning hops. lexical_query should contain concise search
-keywords/entities; semantic_query should express a natural-language information
-need. Preserve the meaning of the question. Return only the requested JSON.
+
+ONCE: Write exactly one query pair that covers the full question. Keep named
+entities, dates, titles, and relationships that narrow the search.
+
+SPLIT: Write exactly two query pairs. Before writing each pair, identify what
+fact a relevant passage should establish. For multi-hop or comparison
+questions, target a different fact in each branch. Each branch must
+be searchable on its own using clues available in the question.
+
+If one branch depends on an entity you do not yet know, keep the
+relationship or other clues that identify it. Do not guess the entity
+or broaden the branch into a generic category search.
+
+For a question with one evidence need, use two grounded search angles
+on that same fact, such as an exact title and a distinctive relationship.
+If the question omits a subject or referent, preserve the ambiguity and
+use the available clues. Do not add generic advice or invent a second hop.
+
+For yes/no questions, search for the underlying facts that could support
+either answer. Before returning the JSON, check that each split branch
+has a clear retrieval target and that neither simply repeats the full
+question or paraphrases the other branch.
+
+Each query pair contains a lexical_query and a semantic_query. lexical_query
+should contain concise search keywords/entities; semantic_query should express
+a natural-language information need. Preserve the meaning of the question.
+Return only the requested JSON.
 """
 
 # The wrapper is for teacher generation only; each nested plan follows prompted.py.
