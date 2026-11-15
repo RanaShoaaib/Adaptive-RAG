@@ -22,16 +22,18 @@ ONCE: exactly one lexical_query and semantic_query pair covering the full
 question. Keep the named entities, dates, titles, and relationships that
 narrow the search.
 
-SPLIT: exactly two distinct, complementary query pairs.
+SPLIT: exactly two distinct, complementary query pairs. Before writing each pair, identify what
+fact a relevant passage should establish.
 
 For multi-hop or comparison questions, decompose the question into separate,
-independently retrievable evidence needs, one per branch. Each branch keeps
-the names, dates, or titles needed to distinguish its own fact from unrelated
-results. Both branches may share the anchor entity the question is about, but
-each branch must seek complementary information, and the two branches must
-not be near-copies of each other. Do not assume the answer to an earlier
-retrieval step, and do not guess the name of an entity the question does not
-name. Describe it by its role in the question.
+independently retrievable evidence needs, one per branch. Each branch targets
+a distinct fact. Avoid near-duplicates and rephrasings of the same search
+intent. Each branch keeps the names, dates, titles, and relationships needed
+to distinguish its own fact from unrelated results, and resolves pronouns or
+references such as "it" or "the company" to the names given in the question.
+Repeat any clue that both branches need. Do not assume the answer to an
+earlier retrieval step. If the question leaves an entity unnamed, describe
+it by its role in the question without guessing its name.
 
 For questions that need only a single fact, write two complementary searches
 for that same fact. Both may keep the key clue needed to stay on topic, and
