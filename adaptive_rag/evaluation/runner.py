@@ -51,6 +51,7 @@ def run_evaluation(
     sampling_seed: int | None = SEED,
     adapter_dir: str | Path | None = None,
     adaptive_use_4bit: bool = False,
+    decision_threshold: float | None = None,
     results_dir: str | Path | None = None,
 ) -> None:
     """Evaluate a fixed subset, resuming compatible checkpoints for the experiment ID."""
@@ -62,6 +63,11 @@ def run_evaluation(
             raise ValueError("adaptive requires an existing adapter_dir")
     elif adapter_dir is not None:
         raise ValueError("adapter_dir is only valid for adaptive strategies")
+    if planner_strategy == "adaptive":
+        if decision_threshold is None or not 0 <= decision_threshold <= 1:
+            raise ValueError("adaptive requires decision_threshold in [0, 1] (see threshold_for_budget)")
+    elif decision_threshold is not None:
+        raise ValueError("decision_threshold is only valid for the adaptive strategy")
 
     subset = load_subset(dataset_path)
     if not len(subset):
@@ -78,6 +84,8 @@ def run_evaluation(
     if adapter_dir is not None:
         experiment_config["models"]["planner_adapter"] = str(Path(adapter_dir).resolve())
         experiment_config["models"]["planner_use_4bit"] = adaptive_use_4bit
+        if decision_threshold is not None:
+            experiment_config["models"]["planner_decision_threshold"] = decision_threshold
         adapter_files = {}
         for path in sorted(Path(adapter_dir).iterdir()):
             if path.is_file():
@@ -107,7 +115,10 @@ def run_evaluation(
         if completed:
             print(f"Resuming {experiment_id}: {len(completed)}/{len(rows)} questions complete")
         if pending:
-            _evaluate_pending(pending, len(rows), PLANNERS[planner_strategy], adapter_dir,
+            planner_fn = PLANNERS[planner_strategy]
+            if decision_threshold is not None:
+                planner_fn = partial(planner_fn, decision_threshold=decision_threshold)
+            _evaluate_pending(pending, len(rows), planner_fn, adapter_dir,
                               adaptive_use_4bit, checkpoint, completed)
         summary = save_experiment_results(
             [completed[qid] for qid in ids], experiment_config, results_dir=results_dir,

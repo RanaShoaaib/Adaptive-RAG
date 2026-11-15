@@ -6,7 +6,9 @@ Training masks prompt tokens and supervises only assistant completion tokens.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import random
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,11 @@ SYSTEM_PROMPT = (
     "Return only a valid JSON object with keys 'strategy' and 'queries'. "
     "Each query must have nonempty 'lexical_query' and 'semantic_query' fields."
 )
+
+
+DECISION_PREFIX = '{"strategy":"'  # The next token starts the "once"/"split" value.
+DEFAULT_DECISION_WEIGHT = 0.25
+DEFAULT_LABEL_SMOOTHING = 0.05
 
 
 def planner_messages(question: str) -> list[dict[str, str]]:
@@ -110,12 +117,70 @@ def tokenize_sft_examples(records: list[dict[str, Any]], tokenizer: Any, *, max_
                 f"Example {record['question_id']} has {len(ids)} tokens; "
                 f"increase max_length ({max_length}) to avoid truncating JSON."
             )
+        strategy = record["target"]["strategy"]
+        if not completion.startswith(DECISION_PREFIX + strategy):
+            raise ValueError("Target JSON must start with the strategy field")
+        decision_pos = len(prefix) + _decision_index(tokenizer, completion_ids, strategy)
         encoded.append({
             "input_ids": ids,
             "attention_mask": [1] * len(ids),
             "labels": [-100] * len(prefix) + completion_ids,
+            "decision_pos": decision_pos,
+            "decision_label": int(strategy == "split"),
         })
     return encoded
+
+
+def _decision_index(tokenizer: Any, completion_ids: list[int], strategy: str) -> int:
+    """Index (within the completion) of the first token of the strategy value."""
+    consumed = 0
+    for index, token_id in enumerate(completion_ids):
+        if consumed == len(DECISION_PREFIX):
+            piece = tokenizer.decode([token_id], skip_special_tokens=False).strip()
+            if piece and strategy.startswith(piece):
+                return index
+            break
+        if consumed > len(DECISION_PREFIX):
+            break
+        consumed += len(tokenizer.decode([token_id], skip_special_tokens=False))
+    raise ValueError(
+        "Cannot isolate the strategy token: the tokenizer merges it with the JSON prefix"
+    )
+
+
+_DUMMY_PLANS = {
+    "once": {"strategy": "once", "queries": [{"lexical_query": "a", "semantic_query": "b"}]},
+    "split": {"strategy": "split", "queries": [
+        {"lexical_query": "a", "semantic_query": "b"},
+        {"lexical_query": "c", "semantic_query": "d"},
+    ]},
+}
+
+
+def _dummy_rows(tokenizer: Any) -> dict[str, dict[str, Any]]:
+    records = [{"question_id": name, "question": "question", "target": plan}
+               for name, plan in _DUMMY_PLANS.items()]
+    rows = tokenize_sft_examples(records, tokenizer, max_length=100_000)
+    return dict(zip(_DUMMY_PLANS, rows))
+
+
+def decision_token_ids(tokenizer: Any) -> dict[str, int]:
+    """Token ids that start the "once" / "split" value after the JSON prefix."""
+    ids = {name: row["input_ids"][row["decision_pos"]] for name, row in _dummy_rows(tokenizer).items()}
+    if ids["once"] == ids["split"]:
+        raise ValueError("'once' and 'split' start with the same token; cannot train a 2-way decision")
+    return ids
+
+
+def decision_prefix_ids(tokenizer: Any) -> list[int]:
+    """Assistant tokens that precede the decision token (identical for every question)."""
+    prefixes = []
+    for row in _dummy_rows(tokenizer).values():
+        start = next(i for i, label in enumerate(row["labels"]) if label != -100)
+        prefixes.append(row["input_ids"][start:row["decision_pos"]])
+    if prefixes[0] != prefixes[1]:
+        raise ValueError("Assistant prefix tokens differ between strategies")
+    return prefixes[0]
 
 
 class CompletionCollator:
@@ -129,11 +194,117 @@ class CompletionCollator:
     def __call__(self, examples):
         import torch
         longest = max(len(row["input_ids"]) for row in examples)
-        return {
+        batch = {
             "input_ids": torch.tensor([row["input_ids"] + [self.pad_id] * (longest - len(row["input_ids"])) for row in examples], dtype=torch.long),
             "attention_mask": torch.tensor([row["attention_mask"] + [0] * (longest - len(row["attention_mask"])) for row in examples], dtype=torch.long),
             "labels": torch.tensor([row["labels"] + [-100] * (longest - len(row["labels"])) for row in examples], dtype=torch.long),
         }
+        if all("decision_pos" in row for row in examples):
+            batch["decision_pos"] = torch.tensor([row["decision_pos"] for row in examples], dtype=torch.long)
+            batch["decision_label"] = torch.tensor([row["decision_label"] for row in examples], dtype=torch.float)
+        return batch
+
+
+def roc_auc(scores: list[float], labels: list[int]) -> float | None:
+    """Rank-based ROC AUC (ties count half); None when only one class is present."""
+    pos = [s for s, y in zip(scores, labels) if y == 1]
+    neg = [s for s, y in zip(scores, labels) if y == 0]
+    if not pos or not neg:
+        return None
+    wins = sum((p > n) + 0.5 * (p == n) for p in pos for n in neg)
+    return wins / (len(pos) * len(neg))
+
+
+def decision_prior_baseline(train_records: list[dict[str, Any]],
+                            val_records: list[dict[str, Any]]) -> dict[str, float]:
+    """Unsmoothed decision loss of always predicting the training split rate."""
+    rate = sum(r["target"]["strategy"] == "split" for r in train_records) / len(train_records)
+    rate = min(max(rate, 1e-6), 1 - 1e-6)
+    losses = [-math.log(rate if r["target"]["strategy"] == "split" else 1 - rate)
+              for r in val_records]
+    return {"train_split_rate": rate, "prior_decision_loss": sum(losses) / len(losses)}
+
+
+def planner_loss_terms(logits, labels, decision_pos, decision_label, token_ids, *,
+                       label_smoothing: float = 0.0):
+    """Return (decision_loss, plan_loss, p_split).
+
+    decision_loss: 2-way BCE between the "split" and "once" first-token logits at the
+    strategy position. plan_loss: mean cross-entropy over the other completion tokens.
+    """
+    import torch
+    import torch.nn.functional as F
+    batch = torch.arange(logits.shape[0], device=logits.device)
+    decision_pos = decision_pos.to(logits.device)
+    at = decision_pos - 1  # logits at t predict the token at t + 1
+    step_logits = logits[batch, at].float()
+    margin = step_logits[:, token_ids["split"]] - step_logits[:, token_ids["once"]]
+    target = decision_label.to(logits.device).float()
+    target = target * (1 - label_smoothing) + 0.5 * label_smoothing
+    decision_loss = F.binary_cross_entropy_with_logits(margin, target)
+
+    shift_logits = logits[:, :-1]
+    shift_labels = labels[:, 1:].to(logits.device).clone()
+    shift_labels[batch, at] = -100  # the decision token belongs to the decision term only
+    mask = shift_labels != -100
+    plan_loss = F.cross_entropy(shift_logits[mask].float(), shift_labels[mask])
+    return decision_loss, plan_loss, torch.sigmoid(margin.detach())
+
+
+def build_planner_trainer(*, model, args, train_dataset, eval_dataset, data_collator,
+                          token_ids: dict[str, int], decision_weight: float,
+                          label_smoothing: float):
+    """Trainer using L = w * decision BCE + (1 - w) * plan CE, with component logging."""
+    from transformers import Trainer
+
+    class PlannerTrainer(Trainer):
+        def _bucket(self, name):
+            if not hasattr(self, "_loss_buckets"):
+                self._loss_buckets = {}
+            return self._loss_buckets.setdefault(
+                name, {"decision": 0.0, "plan": 0.0, "n": 0, "p": [], "y": []})
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+            inputs = dict(inputs)
+            decision_pos = inputs.pop("decision_pos")
+            decision_label = inputs.pop("decision_label")
+            labels = inputs.pop("labels")
+            outputs = model(**inputs)
+            training = model.training
+            decision, plan, p_split = planner_loss_terms(
+                outputs.logits, labels, decision_pos, decision_label, token_ids,
+                label_smoothing=label_smoothing if training else 0.0)
+            loss = decision_weight * decision + (1 - decision_weight) * plan
+            bucket = self._bucket("train" if training else "eval")
+            bucket["decision"] += float(decision.detach())
+            bucket["plan"] += float(plan.detach())
+            bucket["n"] += 1
+            if not training:
+                bucket["p"].extend(p_split.cpu().tolist())
+                bucket["y"].extend(int(v) for v in decision_label.cpu().tolist())
+            return (loss, outputs) if return_outputs else loss
+
+        def log(self, logs, *args, **kwargs):
+            logs = dict(logs)
+            name = "eval" if "eval_loss" in logs else "train" if "loss" in logs else None
+            if name:
+                bucket = self._bucket(name)
+                if bucket["n"]:
+                    prefix = "eval_" if name == "eval" else ""
+                    logs[prefix + "decision_loss"] = bucket["decision"] / bucket["n"]
+                    logs[prefix + "plan_loss"] = bucket["plan"] / bucket["n"]
+                    if name == "eval":
+                        auc = roc_auc(bucket["p"], bucket["y"])
+                        if auc is not None:
+                            logs["eval_decision_auc"] = auc
+                self._loss_buckets[name] = {"decision": 0.0, "plan": 0.0, "n": 0, "p": [], "y": []}
+            return super().log(logs, *args, **kwargs)
+
+    trainer = PlannerTrainer(model=model, args=args, train_dataset=train_dataset,
+                             eval_dataset=eval_dataset, data_collator=data_collator)
+    # The loss is a per-batch mean; make Trainer divide by gradient accumulation steps.
+    trainer.model_accepts_loss_kwargs = False
+    return trainer
 
 
 def load_base_model(model_name: str = SLM_MODEL, *, use_4bit: bool = True):
@@ -183,6 +354,8 @@ def train_planner(
     learning_rate: float = 2e-4, batch_size: int = 2,
     gradient_accumulation_steps: int = 8, seed: int = SEED,
     resume_from_checkpoint: str | Path | bool = False,
+    decision_weight: float = DEFAULT_DECISION_WEIGHT,
+    label_smoothing: float = DEFAULT_LABEL_SMOOTHING,
 ):
     """Fine-tune on selected plans; save adapter/tokenizer to output_dir.
 
@@ -192,8 +365,12 @@ def train_planner(
         raise ValueError("Nonempty train and validation records are required")
     if {r["question_id"] for r in train_records} & {r["question_id"] for r in val_records}:
         raise ValueError("Training and validation question IDs overlap")
+    if not 0 < decision_weight < 1:
+        raise ValueError("decision_weight must be between 0 and 1")
+    if not 0 <= label_smoothing < 0.5:
+        raise ValueError("label_smoothing must be in [0, 0.5)")
     import torch
-    from transformers import Trainer, TrainingArguments, set_seed
+    from transformers import TrainingArguments, set_seed
     from transformers.trainer_utils import get_last_checkpoint
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -204,6 +381,7 @@ def train_planner(
         "rank": rank, "alpha": alpha, "dropout": dropout, "epochs": epochs,
         "learning_rate": learning_rate, "batch_size": batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps, "seed": seed,
+        "decision_weight": decision_weight, "label_smoothing": label_smoothing,
         "train_examples": len(train_records), "val_examples": len(val_records),
         "train_sha256": fingerprint(train_records), "val_sha256": fingerprint(val_records),
     }
@@ -244,12 +422,11 @@ def train_planner(
         fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
         seed=seed,
     )
-    trainer = Trainer(
-        model=model,
-        args=args,
-        train_dataset=train_data,
-        eval_dataset=val_data,
+    trainer = build_planner_trainer(
+        model=model, args=args, train_dataset=train_data, eval_dataset=val_data,
         data_collator=CompletionCollator(tokenizer),
+        token_ids=decision_token_ids(tokenizer),
+        decision_weight=decision_weight, label_smoothing=label_smoothing,
     )
     _write_json_atomic(config_path, config)
     trainer.train(resume_from_checkpoint=str(checkpoint) if checkpoint else None)
@@ -286,9 +463,52 @@ def load_adaptive_planner(adapter_dir: str | Path, *, base_model_name: str | Non
     return model, tokenizer
 
 
+def score_split_probabilities(model: Any, tokenizer: Any, questions: list[str]) -> list[float]:
+    """P(split) from the first strategy-token logits, one forward pass per question."""
+    import torch
+    token_ids = decision_token_ids(tokenizer)
+    assistant_prefix = decision_prefix_ids(tokenizer)
+    probabilities = []
+    for question in questions:
+        ids = tokenizer.apply_chat_template(
+            planner_messages(question), tokenize=True, add_generation_prompt=True,
+            return_dict=False) + assistant_prefix
+        input_ids = torch.tensor([ids], dtype=torch.long, device=model.device)
+        with torch.no_grad():
+            logits = model(input_ids=input_ids).logits[0, -1].float()
+        margin = logits[token_ids["split"]] - logits[token_ids["once"]]
+        probabilities.append(float(torch.sigmoid(margin)))
+    return probabilities
+
+
+def threshold_for_budget(probabilities: list[float], budget: float = 0.10) -> float:
+    """Label-free threshold: the smallest tau routing at least `budget` of questions to SPLIT."""
+    if not probabilities:
+        raise ValueError("probabilities must be nonempty")
+    if not 0 < budget <= 1:
+        raise ValueError("budget must be in (0, 1]")
+    ranked = sorted(probabilities, reverse=True)
+    return ranked[max(math.ceil(budget * len(ranked)), 1) - 1]
+
+
+def _generate_prefilled(model: Any, tokenizer: Any, messages: list[dict[str, str]],
+                        strategy: str, max_new_tokens: int) -> str:
+    """Prefill the JSON prefix plus the first strategy token, then let the model continue."""
+    import torch
+    prefill = decision_prefix_ids(tokenizer) + [decision_token_ids(tokenizer)[strategy]]
+    ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True, return_dict=False) + prefill
+    input_ids = torch.tensor([ids], dtype=torch.long, device=model.device)
+    output = model.generate(input_ids=input_ids, attention_mask=torch.ones_like(input_ids),
+                            max_new_tokens=max_new_tokens, do_sample=False)
+    return tokenizer.decode(prefill + output[0][input_ids.shape[1]:].tolist(),
+                            skip_special_tokens=True)
+
+
 def generate_adaptive_query(model: Any, tokenizer: Any, question: str, *,
                             max_new_tokens: int = SLM_MAX_NEW_TOKENS,
                             forced_strategy: str | None = None,
+                            decision_threshold: float | None = None,
                             max_retries: int = 1) -> dict[str, Any]:
     """Generate a valid plan; optionally force ONCE/SPLIT for controlled ablations.
 
@@ -301,17 +521,17 @@ def generate_adaptive_query(model: Any, tokenizer: Any, question: str, *,
     if max_retries < 0:
         raise ValueError("max_retries must be nonnegative")
     messages = planner_messages(question)
-    if forced_strategy is not None:
-        messages = [*messages, {
-            "role": "user",
-            "content": (
-                f"For this evaluation, use strategy '{forced_strategy}' exactly. "
-                f"Return exactly {1 if forced_strategy == 'once' else 2} retrieval "
-                "query object(s) in the same JSON schema, with no explanation."
-            ),
-        }]
+    # Forced or thresholded strategies are prefilled in the training format, so the
+    # model writes the queries for a decision it was actually trained to follow.
+    strategy, p_split = forced_strategy, None
+    if strategy is None and decision_threshold is not None:
+        p_split = score_split_probabilities(model, tokenizer, [question])[0]
+        strategy = "split" if p_split >= decision_threshold else "once"
     for attempt in range(max_retries + 1):
-        response = generate(model, tokenizer, messages, max_new_tokens=max_new_tokens)
+        if strategy is not None:
+            response = _generate_prefilled(model, tokenizer, messages, strategy, max_new_tokens)
+        else:
+            response = generate(model, tokenizer, messages, max_new_tokens=max_new_tokens)
         cleaned = response.strip()
         if cleaned.startswith("```"):
             lines = cleaned.splitlines()
@@ -320,9 +540,12 @@ def generate_adaptive_query(model: Any, tokenizer: Any, question: str, *,
         try:
             plan = json.loads(cleaned)
             validate_query_plan(plan)
-            if forced_strategy is not None and plan["strategy"] != forced_strategy:
-                raise ValueError(f"Expected {forced_strategy}, got {plan['strategy']}")
-            return {**plan, "question": question, "planner_attempts": attempt + 1}
+            if strategy is not None and plan["strategy"] != strategy:
+                raise ValueError(f"Expected {strategy}, got {plan['strategy']}")
+            result = {**plan, "question": question, "planner_attempts": attempt + 1}
+            if p_split is not None:
+                result["p_split"] = p_split
+            return result
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             if attempt == max_retries:
                 raise ValueError(
@@ -336,7 +559,7 @@ def generate_adaptive_query(model: Any, tokenizer: Any, question: str, *,
                     "Start over. Return only valid JSON with keys strategy and queries; "
                     "each query needs lexical_query and semantic_query. "
                     "ONCE requires exactly one query and SPLIT exactly two. "
-                    + (f"You MUST use strategy '{forced_strategy}'. " if forced_strategy else "")
+                    + (f"You MUST use strategy '{strategy}'. " if strategy else "")
                 ),
             }]
     raise RuntimeError("Unexpected planner generation failure")

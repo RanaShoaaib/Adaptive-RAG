@@ -92,6 +92,9 @@ class FakeChatTokenizer:
             text += "<|im_start|>assistant\n"
         return text
 
+    def decode(self, ids, skip_special_tokens=False, **kwargs):
+        return "".join(chr(i) for i in ids)
+
     def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False,
                             return_dict=True, **kwargs):
         self.calls.append({"tokenize": tokenize, "add_generation_prompt": add_generation_prompt,

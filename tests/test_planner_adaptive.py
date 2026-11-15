@@ -10,10 +10,18 @@ import adaptive_rag.models.lm as lm_module
 from adaptive_rag.planner import adaptive
 from adaptive_rag.planner.adaptive import (
     CompletionCollator,
+    DECISION_PREFIX,
+    decision_prefix_ids,
+    decision_prior_baseline,
+    decision_token_ids,
     generate_adaptive_query,
     load_sft_examples,
+    planner_loss_terms,
     planner_messages,
+    roc_auc,
+    score_split_probabilities,
     split_sft_examples,
+    threshold_for_budget,
     tokenize_sft_examples,
     train_planner,
 )
@@ -25,7 +33,9 @@ def test_training_resume_verifies_data_and_settings(tmp_path, monkeypatch):
 
     checkpoint = tmp_path / "checkpoints" / "checkpoint-1"
     trainer = Mock()
-    monkeypatch.setattr(transformers, "Trainer", Mock(return_value=trainer), raising=False)
+    build_trainer = Mock(return_value=trainer)
+    monkeypatch.setattr(adaptive, "build_planner_trainer", build_trainer)
+    monkeypatch.setattr(adaptive, "decision_token_ids", lambda tokenizer: {"once": 1, "split": 2})
     monkeypatch.setattr(transformers, "TrainingArguments", Mock(), raising=False)
     monkeypatch.setattr(transformers, "set_seed", Mock(), raising=False)
     monkeypatch.setitem(sys.modules, "transformers.trainer_utils", SimpleNamespace(
@@ -49,7 +59,11 @@ def test_training_resume_verifies_data_and_settings(tmp_path, monkeypatch):
         train_planner([example("train", "Changed?")], val, tmp_path, resume_from_checkpoint=True)
     with pytest.raises(ValueError, match="cannot be verified"):
         train_planner(train, val, tmp_path, resume_from_checkpoint=True, rank=8)
+    with pytest.raises(ValueError, match="cannot be verified"):
+        train_planner(train, val, tmp_path, resume_from_checkpoint=True, decision_weight=0.5)
     assert load_model.call_count == 2
+    kwargs = build_trainer.call_args.kwargs
+    assert kwargs["decision_weight"] == 0.25 and kwargs["label_smoothing"] == 0.05
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -225,6 +239,37 @@ class TestTokenizeSftExamples:
             tokenize_sft_examples([example()], FakeChatTokenizer(drop_assistant_content=True))
 
 
+class TestDecisionPosition:
+    def test_decision_token_is_the_first_char_of_the_strategy_value(self):
+        tokenizer = FakeChatTokenizer()
+        rows = tokenize_sft_examples([example("a", plan=once_plan()), example("b", plan=split_plan())], tokenizer)
+        once_row, split_row = rows
+        assert chr(once_row["input_ids"][once_row["decision_pos"]]) == "o" and once_row["decision_label"] == 0
+        assert chr(split_row["input_ids"][split_row["decision_pos"]]) == "s" and split_row["decision_label"] == 1
+        for row in rows:
+            assert row["labels"][row["decision_pos"]] == row["input_ids"][row["decision_pos"]]
+
+    def test_tokens_before_the_decision_are_the_json_prefix(self):
+        tokenizer = FakeChatTokenizer()
+        assert "".join(map(chr, decision_prefix_ids(tokenizer))) == DECISION_PREFIX
+        assert decision_token_ids(tokenizer) == {"once": ord("o"), "split": ord("s")}
+
+    def test_rejects_tokenizers_that_merge_the_decision_with_the_prefix(self):
+        class Merging(FakeChatTokenizer):
+            def decode(self, ids, skip_special_tokens=False, **kwargs):
+                return super().decode(ids)
+
+            def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False,
+                                    return_dict=True, **kwargs):
+                ids = super().apply_chat_template(messages, tokenize, add_generation_prompt, False)
+                if not tokenize:
+                    return ids
+                text = "".join(map(chr, ids)).replace('":"once', '\x01').replace('":"split', '\x02')
+                return [ord(c) for c in text]
+        with pytest.raises(ValueError):
+            tokenize_sft_examples([example()], Merging())
+
+
 class TestCompletionCollator:
     def test_requires_a_pad_token(self):
         tokenizer = FakeChatTokenizer()
@@ -244,6 +289,123 @@ class TestCompletionCollator:
         assert batch["input_ids"].tolist() == [[5, 6, 7], [8, 0, 0]]
         assert batch["attention_mask"].tolist() == [[1, 1, 1], [1, 0, 0]]
         assert batch["labels"].tolist() == [[-100, 6, 7], [8, -100, -100]]
+        assert "decision_pos" not in batch
+
+    def test_passes_decision_fields_through(self):
+        torch = pytest.importorskip("torch")
+        collator = CompletionCollator(FakeChatTokenizer())
+        batch = collator([
+            {"input_ids": [5, 6], "attention_mask": [1, 1], "labels": [-100, 6], "decision_pos": 1, "decision_label": 1},
+            {"input_ids": [8], "attention_mask": [1], "labels": [8], "decision_pos": 0, "decision_label": 0},
+        ])
+        assert batch["decision_pos"].tolist() == [1, 0]
+        assert batch["decision_label"].tolist() == [1.0, 0.0]
+
+
+class TestLoss:
+    @staticmethod
+    def setup():
+        torch = pytest.importorskip("torch")
+        if type(torch).__name__ == "MagicMock" or not hasattr(torch, "randn"):
+            pytest.skip("real torch required")
+        gen = torch.Generator().manual_seed(0)
+        logits = torch.randn(2, 6, 8, generator=gen)
+        labels = torch.tensor([[-100, -100, 3, 4, 5, 6], [-100, 2, 3, 4, 5, -100]])
+        decision_pos = torch.tensor([2, 2])
+        decision_label = torch.tensor([1.0, 0.0])
+        return torch, logits, labels, decision_pos, decision_label, {"once": 3, "split": 4}
+
+    def test_matches_manual_computation_and_excludes_decision_from_plan(self):
+        torch, logits, labels, pos, y, ids = self.setup()
+        decision, plan, p = planner_loss_terms(logits, labels, pos, y, ids)
+        margin = torch.stack([logits[b, 1, ids["split"]] - logits[b, 1, ids["once"]] for b in range(2)])
+        expected = torch.nn.functional.binary_cross_entropy_with_logits(margin, y)
+        assert torch.allclose(decision, expected)
+        assert torch.allclose(p, torch.sigmoid(margin))
+        losses = []
+        for b in range(2):
+            for t in range(5):  # logits[t] predicts labels[t + 1]
+                target = labels[b, t + 1]
+                if target != -100 and t + 1 != 2:
+                    losses.append(torch.nn.functional.cross_entropy(logits[b, t:t + 1], target.view(1)))
+        assert torch.allclose(plan, torch.stack(losses).mean())
+
+    def test_plan_loss_ignores_the_decision_step_logits(self):
+        torch, logits, labels, pos, y, ids = self.setup()
+        _, plan_a, _ = planner_loss_terms(logits, labels, pos, y, ids)
+        changed = logits.clone()
+        changed[:, 1] += 5.0
+        _, plan_b, _ = planner_loss_terms(changed, labels, pos, y, ids)
+        assert torch.allclose(plan_a, plan_b)
+
+    def test_label_smoothing_changes_only_the_decision_term(self):
+        torch, logits, labels, pos, y, ids = self.setup()
+        d0, p0, _ = planner_loss_terms(logits, labels, pos, y, ids)
+        d1, p1, _ = planner_loss_terms(logits, labels, pos, y, ids, label_smoothing=0.05)
+        assert torch.allclose(p0, p1) and not torch.allclose(d0, d1)
+        margin = torch.stack([logits[b, 1, 4] - logits[b, 1, 3] for b in range(2)])
+        smoothed = y * 0.95 + 0.025
+        assert torch.allclose(d1, torch.nn.functional.binary_cross_entropy_with_logits(margin, smoothed))
+
+    def test_gradient_reaches_the_decision_logits(self):
+        torch, logits, labels, pos, y, ids = self.setup()
+        logits.requires_grad_(True)
+        decision, _, _ = planner_loss_terms(logits, labels, pos, y, ids)
+        decision.backward()
+        assert logits.grad[:, 1, [3, 4]].abs().sum() > 0 and logits.grad[:, 0].abs().sum() == 0
+
+
+class TestDecisionHelpers:
+    def test_roc_auc(self):
+        assert roc_auc([0.9, 0.8, 0.2, 0.1], [1, 1, 0, 0]) == 1.0
+        assert roc_auc([0.1, 0.2, 0.8, 0.9], [1, 1, 0, 0]) == 0.0
+        assert roc_auc([0.5, 0.5], [1, 0]) == 0.5
+        assert roc_auc([0.5, 0.6], [1, 1]) is None
+
+    def test_prior_baseline_is_the_entropy_of_the_train_rate(self):
+        import math
+        train = [example(f"t{i}", plan=split_plan() if i == 0 else once_plan()) for i in range(4)]
+        val = [example("v1", plan=once_plan()), example("v2", plan=split_plan())]
+        result = decision_prior_baseline(train, val)
+        assert result["train_split_rate"] == 0.25
+        assert result["prior_decision_loss"] == pytest.approx((-math.log(0.75) - math.log(0.25)) / 2)
+
+    def test_threshold_routes_at_least_the_budget_and_is_label_free(self):
+        probs = [i / 100 for i in range(100)]
+        tau = threshold_for_budget(probs, 0.10)
+        assert tau == 0.90 and sum(p >= tau for p in probs) == 10
+        assert threshold_for_budget([0.2, 0.2, 0.2], 0.10) == 0.2
+        assert threshold_for_budget(probs, 1.0) == 0.0
+
+    @pytest.mark.parametrize("budget", [0, -0.1, 1.5])
+    def test_threshold_rejects_bad_budget(self, budget):
+        with pytest.raises(ValueError):
+            threshold_for_budget([0.1, 0.2], budget)
+
+    def test_threshold_rejects_empty(self):
+        with pytest.raises(ValueError):
+            threshold_for_budget([], 0.1)
+
+    def test_scores_probability_from_the_last_position_after_the_json_prefix(self):
+        torch = pytest.importorskip("torch")
+        if type(torch).__name__ == "MagicMock" or not hasattr(torch, "randn"):
+            pytest.skip("real torch required")
+        tokenizer = FakeChatTokenizer()
+        seen = []
+
+        class Model:
+            device = "cpu"
+
+            def __call__(self, input_ids):
+                seen.append(input_ids[0].tolist())
+                logits = torch.zeros(1, input_ids.shape[1], 256)
+                logits[0, -1, ord("s")] = 2.0
+                logits[0, -1, ord("o")] = 0.0
+                return SimpleNamespace(logits=logits)
+
+        (p,) = score_split_probabilities(Model(), tokenizer, ["Who?"])
+        assert p == pytest.approx(torch.sigmoid(torch.tensor(2.0)).item())
+        assert "".join(map(chr, seen[0])).endswith("<|im_start|>assistant\n" + DECISION_PREFIX)
 
 
 # ----------------------------------------------------------------------------- training guards
@@ -310,22 +472,49 @@ class TestGenerateAdaptiveQuery:
             generate_adaptive_query(None, None, "q?", max_retries=0)
         assert len(fake.calls) == 1
 
-    def test_forced_strategy_adds_instruction_and_enforces_result(self, script):
-        fake = script(plan_json(split_plan()))
+    @pytest.fixture
+    def prefilled(self, monkeypatch):
+        calls = []
+
+        def install(*responses):
+            queue = list(responses)
+
+            def fake(model, tokenizer, messages, strategy, max_new_tokens):
+                calls.append({"messages": messages, "strategy": strategy})
+                return queue.pop(0)
+            monkeypatch.setattr(adaptive, "_generate_prefilled", fake)
+            return calls
+        return install
+
+    def test_forced_strategy_prefills_without_an_instruction_message(self, prefilled):
+        calls = prefilled(plan_json(split_plan()))
         plan = generate_adaptive_query(None, None, "q?", forced_strategy="split")
-        assert plan["strategy"] == "split"
-        instruction = fake.calls[0]["messages"][-1]["content"]
-        assert "strategy 'split'" in instruction and "2 retrieval" in instruction
+        assert plan["strategy"] == "split" and "p_split" not in plan
+        assert calls[0]["strategy"] == "split"
+        assert calls[0]["messages"] == planner_messages("q?")
 
-    def test_forced_once_asks_for_a_single_query(self, script):
-        fake = script(plan_json(once_plan()))
-        generate_adaptive_query(None, None, "q?", forced_strategy="once")
-        assert "1 retrieval" in fake.calls[0]["messages"][-1]["content"]
-
-    def test_forced_strategy_mismatch_is_rejected(self, script):
-        script(plan_json(once_plan()), plan_json(once_plan()))
+    def test_forced_strategy_mismatch_is_rejected(self, prefilled):
+        prefilled(plan_json(once_plan()), plan_json(once_plan()))
         with pytest.raises(ValueError, match="Expected split"):
             generate_adaptive_query(None, None, "q?", forced_strategy="split")
+
+    @pytest.mark.parametrize("p_split, threshold, expected", [
+        (0.40, 0.30, "split"), (0.30, 0.30, "split"), (0.29, 0.30, "once"),
+    ])
+    def test_threshold_decides_the_prefilled_strategy(self, prefilled, monkeypatch, p_split, threshold, expected):
+        monkeypatch.setattr(adaptive, "score_split_probabilities", lambda m, t, qs: [p_split])
+        plan_for = {"split": split_plan(), "once": once_plan()}[expected]
+        calls = prefilled(plan_json(plan_for))
+        plan = generate_adaptive_query(None, None, "q?", decision_threshold=threshold)
+        assert calls[0]["strategy"] == expected and plan["strategy"] == expected
+        assert plan["p_split"] == p_split
+
+    def test_forced_strategy_overrides_the_threshold(self, prefilled, monkeypatch):
+        monkeypatch.setattr(adaptive, "score_split_probabilities",
+                            lambda *a: pytest.fail("must not score when forced"))
+        calls = prefilled(plan_json(once_plan()))
+        generate_adaptive_query(None, None, "q?", forced_strategy="once", decision_threshold=0.0)
+        assert calls[0]["strategy"] == "once"
 
     def test_argument_validation(self, script):
         script()

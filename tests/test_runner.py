@@ -83,6 +83,22 @@ class TestValidation:
         with pytest.raises(ValueError, match="adapter_dir"):
             env.run("adaptive", adapter_dir=tmp_path / "missing")
 
+    def test_adaptive_requires_a_decision_threshold(self, env, tmp_path):
+        adapter = tmp_path / "adapter"
+        adapter.mkdir()
+        with pytest.raises(ValueError, match="decision_threshold"):
+            env.run("adaptive", adapter_dir=adapter)
+        with pytest.raises(ValueError, match="decision_threshold"):
+            env.run("adaptive", adapter_dir=adapter, decision_threshold=1.5)
+
+    def test_decision_threshold_rejected_for_other_strategies(self, env, tmp_path):
+        adapter = tmp_path / "adapter"
+        adapter.mkdir()
+        with pytest.raises(ValueError, match="only valid"):
+            env.run("adaptive_split", adapter_dir=adapter, decision_threshold=0.3)
+        with pytest.raises(ValueError, match="only valid"):
+            env.run("prompted", decision_threshold=0.3)
+
     def test_adapter_dir_rejected_for_non_adaptive(self, env, tmp_path):
         with pytest.raises(ValueError, match="only valid"):
             env.run("prompted", adapter_dir=tmp_path)
@@ -198,14 +214,17 @@ class TestRun:
         adapter.mkdir()
         captured = {}
 
-        def adaptive(model, tok, question):
+        def adaptive(model, tok, question, decision_threshold=None):
             captured["args"] = (model, tok)
+            captured["threshold"] = decision_threshold
             return {"question": question, "strategy": "once", "queries": once_plan()["queries"]}
 
         monkeypatch.setitem(runner.PLANNERS, "adaptive", adaptive)
-        env.run("adaptive", adapter_dir=adapter, adaptive_use_4bit=True)
+        env.run("adaptive", adapter_dir=adapter, adaptive_use_4bit=True, decision_threshold=0.3)
         assert captured["args"] == ("adaptive-model", "adaptive-tok")
+        assert captured["threshold"] == 0.3
         config_file = next(env.results.rglob("*config*.json"))
         models = json.loads(config_file.read_text())["models"]
         assert models["planner_adapter"] == str(adapter.resolve())
         assert models["planner_use_4bit"] is True
+        assert models["planner_decision_threshold"] == 0.3
